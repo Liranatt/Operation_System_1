@@ -93,7 +93,7 @@ sys_co_yield(void)
   struct proc *target = 0;
 
   argint(0, &target_pid);
-  argbint(1, &value);
+  argint(1, &value);
 
   self = myproc();
   if (target_pid <= 0)
@@ -106,7 +106,7 @@ sys_co_yield(void)
     acquire(&p->lock);
     if (p->pid == target_pid && p->state != UNUSED && p->state != ZOMBIE) {
       if (p->killed) {
-        release(&p->lock)ף
+        release(&p->lock);
         return -1;
       }
 
