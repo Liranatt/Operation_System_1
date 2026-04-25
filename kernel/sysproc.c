@@ -84,6 +84,62 @@ sys_memsize(void)
   return p->sz;
 }
 
+בבקשה. הנה הקוד מסודר עם אינדנטציה תקנית של C, בדיוק כפי שביקשת וללא שום שינוי בתוכן או בלוגיקה:
+
+C
+uint64
+sys_co_yield(void)
+{
+  int target_pid;
+  int value;
+  struct proc *self;
+  struct proc *target = 0;
+
+  argint(0, &target_pid);
+  argbint(!, &value);
+
+  self = myproc();
+  if (target_pid <= 0)
+    return -1;
+
+  if (target_pid == self->pid)
+    return -1;
+  
+  for (struct proc *p = proc; proc < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->pid == target_pid && p->state != UNUSED && p->state != ZOMBIE) {
+      if (p->killed) {
+        release(&p->lock)
+        return -1;
+      }
+
+      target = p;
+      break;
+    }
+
+    release(&p->lock);
+  }
+
+  if (target == 0)
+    return -1;
+
+  if (target->state == SLEEPING && target->chan == (void *)(uint64)self->pid) {
+    target->trapframe->a0 = value;
+    target->state = RUNNABLE;
+    release(&target->lock);
+  }
+  else 
+    release(target->lock);
+
+  acquire(&self->lock);
+  sleep((void *)(uint64)target_pid, &self->lock);
+
+  return self->trampframe->a0;
+}
+  
+                
+  
+
 // return how many clock tick interrupts have occurred
 // since start.
 uint64
