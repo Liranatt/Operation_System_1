@@ -105,7 +105,7 @@ sys_co_yield(void)
   for (struct proc *p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
     if (p->pid == target_pid && p->state != UNUSED && p->state != ZOMBIE) {
-      if (p->killed) {
+      if (killed(p)) {
         release(&p->lock);
         return -1;
       }
@@ -128,8 +128,10 @@ sys_co_yield(void)
   else 
     release(&target->lock);
 
-  acquire(&self->lock);
-  sleep((void *)(uint64)target_pid, &self->lock);
+  extern struct spinlock wait_lock;
+
+  acquire(&wait_lock);
+  sleep((void *)(uint64)target_pid, &wait_lock);
 
   return self->trapframe->a0;
 }
