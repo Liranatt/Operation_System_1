@@ -93,7 +93,7 @@ sys_co_yield(void)
   struct proc *target = 0;
 
   argint(0, &target_pid);
-  argbint(!, &value);
+  argbint(1, &value);
 
   self = myproc();
   if (target_pid <= 0)
