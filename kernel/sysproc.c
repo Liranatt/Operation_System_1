@@ -102,11 +102,11 @@ sys_co_yield(void)
   if (target_pid == self->pid)
     return -1;
   
-  for (struct proc *p = proc; proc < &proc[NPROC]; p++) {
+  for (struct proc *p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
     if (p->pid == target_pid && p->state != UNUSED && p->state != ZOMBIE) {
       if (p->killed) {
-        release(&p->lock)
+        release(&p->lock)ף
         return -1;
       }
 
@@ -126,12 +126,12 @@ sys_co_yield(void)
     release(&target->lock);
   }
   else 
-    release(target->lock);
+    release(&target->lock);
 
   acquire(&self->lock);
   sleep((void *)(uint64)target_pid, &self->lock);
 
-  return self->trampframe->a0;
+  return self->trapframe->a0;
 }
   
                 
