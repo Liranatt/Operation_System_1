@@ -102,7 +102,7 @@ extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
 extern uint64 sys_memsize(void);
-extern unit64 sys_co_yield(void);
+extern uint64 sys_co_yield(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.

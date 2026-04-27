@@ -509,6 +509,19 @@ yield(void)
   release(&p->lock);
 }
 
+void
+proc_handoff(struct proc *from, struct proc *to)
+{
+  struct cpu *c = mycpu();
+
+  if(!holding(&to->lock))
+    panic("proc_handoff to->lock");
+
+  c->proc = to;
+  swtch(&from->context, &to->context);
+  c->proc = from;
+}
+
 // A fork child's very first scheduling by scheduler()
 // will swtch to forkret.
 void
@@ -681,3 +694,4 @@ procdump(void)
     printf("\n");
   }
 }
+
