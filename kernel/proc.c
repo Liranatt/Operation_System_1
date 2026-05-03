@@ -509,19 +509,6 @@ yield(void)
   release(&p->lock);
 }
 
-void
-proc_handoff(struct proc *from, struct proc *to)
-{
-  struct cpu *c = mycpu();
-
-  if(!holding(&to->lock))
-    panic("proc_handoff to->lock");
-
-  c->proc = to;
-  swtch(&from->context, &to->context);
-  c->proc = from;
-}
-
 // A fork child's very first scheduling by scheduler()
 // will swtch to forkret.
 void
@@ -695,3 +682,136 @@ procdump(void)
   }
 }
 
+
+struct proc*
+getproc(int pid)
+{
+  struct proc *p;
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->pid == pid) {
+      release(&p->lock);
+      return p;
+    }
+    release(&p->lock);
+  }
+  return 0;
+}
+
+// co_yield(pid, value): hand control directly to the kernel thread of the
+// process with the given pid, delivering `value` as the int return value of
+// that proc's own outstanding co_yield syscall. The current proc parks until
+// some other proc calls co_yield(my_pid, V), at which point this function
+// resumes and returns V.
+//
+// Conventions used:
+//   - "Parked in co_yield" is encoded as state==SLEEPING && chan==CO_CHAN,
+//     where CO_CHAN is a unique kernel address (the function itself). This
+//     lets us distinguish co_yield-parked procs from procs sleeping on
+//     pipes, ticks, wait, etc.
+//   - The payload travels through the receiver's trapframe->a0, which is
+//     also where syscall() will place the syscall return value on the way
+//     back to user space.
+//   - Two p->locks are held across the direct swtch (one for each side),
+//     acquired in address order to avoid deadlock with a concurrent
+//     co_yield going the other direction. mycpu()->intena is saved and
+//     restored across swtch, exactly as sched() does.
+//
+// Design choice (rendezvous channel granularity):
+//   We park on the single sentinel CO_CHAN, not on CO_CHAN+target_pid.
+//   Consequence: if proc A parks waiting after co_yield(B, ...) and some
+//   third proc C calls co_yield(A, V) before B does, A will wake up with
+//   V from C instead of the value it expected from B. This is the
+//   "anyone-wakes" semantics. The spec (Task 3) explicitly permits not
+//   handling such multi-party scenarios as long as the choice is
+//   documented; the required ping-pong test in user/co_test.c only
+//   involves two procs, so this is never observed there. We picked the
+//   looser rule because the stricter "only the addressed counterpart may
+//   wake me" rule is more deadlock-prone (e.g. C above would itself park
+//   forever if B never yields).
+//
+// Not handled (documented edge cases):
+//   - Pid recycling: if A parks after co_yield(B, ...), B exits, and a
+//     new proc reuses B's pid and yields to A, A cannot tell. Same
+//     looseness as above.
+//   - Multi-CPU: the assignment requires correctness only when both
+//     procs run on the same CPU (Makefile sets CPUS := 1).
+int
+co_yield(int pid, int value)
+{
+  void *const CO_CHAN = (void*)co_yield;
+
+  struct proc *me = mycpu()->proc;  // avoid shadowing the myproc() function
+
+  if (pid <= 0 || value < 0 || me->pid == pid)
+    return -1;
+
+  struct proc *other = getproc(pid);
+  if (other == 0)
+    return -1;
+
+  // acquire both locks in address order to prevent symmetric deadlock
+  struct proc *first  = (me < other) ? me    : other;
+  struct proc *second = (me < other) ? other : me;
+  acquire(&first->lock);
+  acquire(&second->lock);
+
+  // re-check target validity after acquiring locks
+  if (other->state == ZOMBIE || other->state == UNUSED || other->killed) {
+    release(&second->lock);
+    release(&first->lock);
+    return -1;
+  }
+
+  // ----------------------------------------------------------------
+  // CASE B: target is parked in co_yield — perform direct CPU switch
+  // ----------------------------------------------------------------
+  if (other->state == SLEEPING && other->chan == CO_CHAN) {
+
+    other->trapframe->a0 = (uint64)(uint32)value;  // deliver value via syscall return slot
+    other->chan  = 0;
+    other->state = RUNNABLE;
+
+    me->chan  = CO_CHAN;
+    me->state = SLEEPING;
+
+    struct cpu *c = mycpu();
+    c->proc = other;  // hand the CPU to other
+
+    // release other->lock; keep only me->lock so noff == 1 before swtch
+    if (other == second)
+      release(&second->lock);
+    else
+      release(&first->lock);
+
+    int intena = c->intena;
+    swtch(&me->context, &other->context);  // direct switch, bypasses scheduler
+    mycpu()->intena = intena;
+
+    // resumed: the future sender released me->lock before its own swtch
+    if (killed(mycpu()->proc))
+      return -1;
+
+    return (int)mycpu()->proc->trapframe->a0;
+  }
+
+  // ----------------------------------------------------------------
+  // CASE A: target not yet parked — sleep and wait for it to yield to us
+  // ----------------------------------------------------------------
+  me->chan  = CO_CHAN;
+  me->state = SLEEPING;
+
+  // release other->lock; keep only me->lock so noff == 1 for sched()
+  if (other == second)
+    release(&second->lock);
+  else
+    release(&first->lock);
+
+  sched();  // yields to scheduler; resumed when a sender does Case B on us
+
+  // resumed: sender released me->lock before its swtch, so no locks held here
+  if (killed(mycpu()->proc))
+    return -1;
+
+  return (int)mycpu()->proc->trapframe->a0;
+}

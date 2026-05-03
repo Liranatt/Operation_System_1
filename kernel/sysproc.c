@@ -5,7 +5,6 @@
 #include "memlayout.h"
 #include "spinlock.h"
 #include "proc.h"
-extern struct proc proc[NPROC];
 uint64
 sys_exit(void)
 {
@@ -87,71 +86,15 @@ sys_memsize(void)
 uint64
 sys_co_yield(void)
 {
-  int target_pid;
+  int pid;
   int value;
-  struct proc *self;
-  struct proc *target = 0;
 
-  argint(0, &target_pid);
+  argint(0, &pid);
   argint(1, &value);
 
-  self = myproc();
 
-  if(target_pid <= 0)
-    return -1;
-  if(target_pid == self->pid)
-    return -1;
-
-  for(struct proc *p = proc; p < &proc[NPROC]; p++){
-    acquire(&p->lock);
-    if(p->pid == target_pid){
-      target = p;
-      break;
-    }
-    release(&p->lock);
-  }
-
-  if(target == 0)
-    return -1;
-
-  if(target->state == UNUSED || target->state == ZOMBIE || target->killed){
-    release(&target->lock);
-    return -1;
-  }
-
-  if(target->state == SLEEPING && target->chan == (void *)(uint64)self->pid){
-    // Rendezvous complete now: return peer's sent value immediately.
-    int ret = (int)target->trapframe->a1;
-    target->trapframe->a0 = value;
-    target->state = RUNNABLE;
-    release(&target->lock);
-    return ret;
-  }
-
-  if(target->state != RUNNABLE){
-    release(&target->lock);
-    return -1;
-  }
-
-  // First arriver: sleep until peer yields back.
-  self->trapframe->a0 = -1;
-  self->chan = (void *)(uint64)target_pid;
-  self->state = SLEEPING;
-
-  target->state = RUNNING;
-  proc_handoff(self, target);
-
-  if(holding(&self->lock))
-    release(&self->lock);
-
-  self->chan = 0;
-
-  if(killed(self))
-    return -1;
-  return self->trapframe->a0;
+  return co_yield(pid, value);
 }
-                
-  
 
 // return how many clock tick interrupts have occurred
 // since start.
