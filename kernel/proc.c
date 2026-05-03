@@ -698,47 +698,9 @@ getproc(int pid)
   return 0;
 }
 
-// ============================================================================
-// co_yield(pid, value)
-//
-// Coroutine-style direct process switch.
-//
-// LOCKING PROTOCOL:
-// =================
-// We always acquire BOTH locks (me + other) ordered by proc* address
-// to prevent deadlock.  After that:
-//
-// CASE A — other is NOT parked (not sleeping on CO_CHAN):
-//   We park ourselves (state=SLEEPING, chan=CO_CHAN, store value in
-//   trapframe->a0), release BOTH locks, then re-acquire ONLY me->lock
-//   and call sched().
-//   sched() contract: noff==1, p->lock held, state!=RUNNING  → all met.
-//   We sleep until some future CASE_B switcher sends us back.
-//
-// CASE B — other IS parked (SLEEPING on CO_CHAN):
-//   We are the active switcher.  We must call swtch() with exactly
-//   ONE lock held — other->lock — because other will resume from
-//   sched() and sched() was entered with its own lock held.
-//   So: we release me->lock BEFORE swtch, keeping other->lock.
-//   After swtch returns (when someone switches back to US):
-//     - me->lock is held (the future CASE_B switcher holds it per
-//       this same protocol)
-//     - noff == 1  ✓
-//   We do a single release(&me->lock) to restore lock-free state for
-//   the usertrapret() path.
-//
-// Value passing:
-//   CASE A stores value in me->trapframe->a0 before parking.
-//   CASE B reads it from other->trapframe->a0, then overwrites it
-//   with the new value before swtch so other wakes up with the right
-//   return value already in a0.
-// ============================================================================
 int
 co_yield(int pid, int value)
 {
-  // Sentinel channel: unique kernel address, never used by sleep/wakeup.
-  // A process parked in co_yield sleeps on this channel and is invisible
-  // to the normal scheduler (which only runs RUNNABLE processes).
   void *const CO_CHAN = (void*)co_yield;
 
   struct proc *me = mycpu()->proc;
@@ -763,15 +725,13 @@ co_yield(int pid, int value)
   }
 
   // ── acquire both locks in address order ───────────────────────────
-  // This prevents deadlock when two processes co_yield to each other
-  // simultaneously (impossible with NCPU=1, but correct regardless).
   struct proc *first  = (me < other) ? me    : other;
   struct proc *second = (me < other) ? other : me;
   acquire(&first->lock);
   acquire(&second->lock);
-  // noff == 2 from here until we release one
+  // noff == 2
 
-  // ── proc table snapshot (taken while both locks held) ─────────────
+  // ── proc table snapshot ───────────────────────────────────────────
   printf("[CY] === PROC TABLE (caller=%d noff=%d) ===\n",
          me->pid, mycpu()->noff);
   {
@@ -811,70 +771,47 @@ co_yield(int pid, int value)
   struct cpu *c = mycpu();
 
   // ══════════════════════════════════════════════════════════════════
-  // CASE B: other is parked on CO_CHAN → we are the active switcher
+  // CASE B: other is parked → direct switch
   // ══════════════════════════════════════════════════════════════════
   if (other->state == SLEEPING && other->chan == CO_CHAN) {
     printf("[CY] CASE_B caller=%d: target=%d is parked -> direct switch\n",
            me->pid, other->pid);
 
-    // Read the value other stored when it parked (CASE_A wrote it into
-    // other->trapframe->a0 before going to sleep)
     int got = (int)(uint32)other->trapframe->a0;
     printf("[CY] CASE_B caller=%d: read got=%d from target=%d trapframe\n",
            me->pid, got, other->pid);
 
-    // Deliver our value to other: it will return this from co_yield
     other->trapframe->a0 = (uint64)(uint32)value;
-
-    // Wake other: skip RUNNABLE entirely, go straight to RUNNING.
-    // other will resume from inside sched(), which was entered with
-    // other->lock held — that lock is still held right now (noff==2).
     other->chan  = 0;
     other->state = RUNNING;
+    me->chan     = CO_CHAN;
+    me->state    = SLEEPING;
+    c->proc      = other;
 
-    // Park ourselves
-    me->chan  = CO_CHAN;
-    me->state = SLEEPING;
-
-    // The CPU now logically belongs to other
-    c->proc = other;
-
-    // ── CRITICAL: fix noff to 1 before swtch ──────────────────────
-    // We hold first->lock and second->lock (noff==2).
-    // We must release me->lock and keep other->lock.
-    //
-    // After swtch, whoever switches BACK to us will hold me->lock
-    // (same protocol: CASE_B switcher keeps other->lock = our lock).
-    // That is how me->lock gets re-acquired for the resume path.
+    // ── DROP me->lock, KEEP other->lock (noff: 2 → 1) ─────────────
+    // other resumes from sched() which was entered with other->lock
+    // held and noff==1 — we must preserve that invariant.
+    // When we resume: the future CASE_B switcher kept our lock, so
+    // me->lock is held on re-entry (noff==1).
     if (me == first) {
-      // first == me, second == other  →  release first (me)
-      printf("[CY] CASE_B caller=%d: release me=first->lock,"
-             " keep other=second->lock (noff will be 1)\n", me->pid);
-      release(&second->lock);
-    } else {
-      // first == other, second == me  →  release second (me)
-      printf("[CY] CASE_B caller=%d: release me=second->lock,"
-             " keep other=first->lock (noff will be 1)\n", me->pid);
-      release(&first->lock);
+    // first == me → release me (first), keep other (second)
+    printf("[CY] CASE_B caller=%d: release me=first, keep other=second\n", me->pid);
+    release(&first->lock);       // ← משחרר ME ✓
+} else {
+    // second == me → release me (second), keep other (first)
+    printf("[CY] CASE_B caller=%d: release me=second, keep other=first\n", me->pid);
+    release(&second->lock);      // ← משחרר ME ✓
     }
-    // noff == 1, holding other->lock  ✓
-    // other->state == RUNNING         ✓
-    // me->state    == SLEEPING        ✓
-    // c->proc      == other           ✓
+    // noff==1, other->lock held ✓
 
     printf("[CY] CASE_B caller=%d: swtch -> pid=%d"
-           " (delivering value=%d, we will get back got=%d later)\n",
+           " (delivering value=%d, will get back got=%d later)\n",
            me->pid, other->pid, value, got);
 
-    // intena belongs to this kernel thread, not the CPU — save/restore
     int intena = c->intena;
     swtch(&me->context, &other->context);
-    // ── WE ARE BACK (someone CASE_B-switched to us) ───────────────
-    // Invariant on re-entry:
-    //   mycpu()->proc == me  (set by the CASE_B that switched to us)
-    //   me->lock is held     (the CASE_B switcher kept our lock)
-    //   noff == 1            ✓
-    //   me->trapframe->a0    == value delivered to us by the switcher
+    // ── RESUMED: a future CASE_B switched back to us ──────────────
+    // Invariants: c->proc==me, me->lock held, noff==1
     mycpu()->intena = intena;
 
     printf("[CY] CASE_B caller=%d: RESUMED"
@@ -885,8 +822,7 @@ co_yield(int pid, int value)
            mycpu()->noff);
 
     int was_killed = me->killed;
-    // Release me->lock — returns us to lock-free state for usertrapret
-   // release(&me->lock);
+   // release(&me->lock);   // noff: 1 → 0, clean for usertrapret ✓
 
     if (was_killed) {
       printf("[CY] CASE_B caller=%d: killed on resume -> return -1\n",
@@ -898,12 +834,11 @@ co_yield(int pid, int value)
   }
 
   // ══════════════════════════════════════════════════════════════════
-  // CASE A: other is NOT parked → we park and wait
+  // CASE A: other NOT parked → park ourselves and wait
   // ══════════════════════════════════════════════════════════════════
   printf("[CY] CASE_A caller=%d: target=%d not parked (state=%d)"
          " -> parking self\n", me->pid, other->pid, other->state);
 
-  // Store our value so a future CASE_B can read it from trapframe->a0
   me->trapframe->a0 = (uint64)(uint32)value;
   me->chan  = CO_CHAN;
   me->state = SLEEPING;
@@ -911,22 +846,22 @@ co_yield(int pid, int value)
   printf("[CY] CASE_A caller=%d: stored value=%d in trapframe,"
          " state=SLEEPING chan=CO_CHAN\n", me->pid, value);
 
-  // Release BOTH locks (noff -> 0)
+  // Release BOTH locks (noff → 0)
   release(&second->lock);
   release(&first->lock);
 
-  // Acquire ONLY me->lock, then call sched()
-  // sched() requires: p->lock held, noff==1, state!=RUNNING  → all met
+  // Re-acquire ONLY me->lock, satisfy sched() contract (noff==1)
   acquire(&me->lock);
   printf("[CY] CASE_A caller=%d: acquired me->lock, calling sched()"
          " noff=%d\n", me->pid, mycpu()->noff);
   sched();
 
-  // ── RESUMED from CASE_B direct switch ─────────────────────────────
-  // Invariant on re-entry:
-  //   me->lock held (noff==1)   — the CASE_B that woke us kept our lock
-  //   me->trapframe->a0         — value delivered by CASE_B
-  //   me->state == RUNNING      — set by CASE_B before swtch
+  // ── RESUMED: CASE_B switched directly to our context ─────────────
+  // sched() did swtch(me->ctx, scheduler->ctx).
+  // CASE_B bypassed the scheduler and jumped directly here.
+  // The scheduler's swtch is still suspended — it will resume when
+  // we next call sched() (e.g. via yield/sleep/exit).
+  // Invariants: me->lock held (CASE_B kept other->lock=our lock), noff==1
   printf("[CY] CASE_A caller=%d: RESUMED"
          " trapframe_a0=%d killed=%d noff=%d\n",
          me->pid,
@@ -936,7 +871,7 @@ co_yield(int pid, int value)
 
   int got        = (int)(uint32)me->trapframe->a0;
   int was_killed = me->killed;
-  release(&me->lock);
+  release(&me->lock);   // noff: 1 → 0, clean for usertrapret ✓
 
   if (was_killed) {
     printf("[CY] CASE_A caller=%d: killed on resume -> return -1\n",

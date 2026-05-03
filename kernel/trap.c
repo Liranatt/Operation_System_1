@@ -65,6 +65,9 @@ usertrap(void)
     intr_on();
 
     syscall();
+    if (holding(&p->lock))
+    release(&p->lock);
+
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {

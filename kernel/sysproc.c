@@ -83,17 +83,21 @@ sys_memsize(void)
   return p->sz;
 }
 
-uint64
-sys_co_yield(void)
-{
-  int pid;
-  int value;
+uint64 sys_co_yield(void) {
+    int target_pid, val;
+    struct proc *p = myproc();
 
-  argint(0, &pid);
-  argint(1, &value);
+    if(argint(0, &target_pid) < 0 || argint(1, &val) < 0) {
+        printf("[CY] PID %d: argint failed\n", p->pid);
+        return -1;
+    }
 
-
-  return co_yield(pid, value);
+    printf("[CY] PID %d: sys_co_yield called (target=%d, val=%d)\n", p->pid, target_pid, val);
+    
+    uint64 ret = co_yield(target_pid, val);
+    
+    printf("[CY] PID %d: sys_co_yield returning value %d\n", p->pid, (int)ret);
+    return ret;
 }
 
 // return how many clock tick interrupts have occurred
